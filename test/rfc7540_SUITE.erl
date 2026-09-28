@@ -2037,6 +2037,72 @@ rst_stream_closed_reject_headers(Config) ->
 	{ok, << _:24, 7:8, _:72, 5:32 >>} = gen_tcp:recv(Socket, 17, 6000),
 	ok.
 
+%% The client sent the RST_STREAM above. Here the server sends it.
+%% A header block already in flight must be decoded and discarded.
+headers_after_sending_rst_stream(Config) ->
+	doc("A HEADERS block received after sending RST_STREAM must be "
+		"decoded and discarded. (RFC7540 4.3, RFC7540 5.1)"),
+	{ok, Socket} = do_handshake(Config),
+	%% The request does not end the stream. The handler replies without
+	%% reading a body, so the server resets the stream.
+	{ReqHeaders1, Enc1} = cow_hpack:encode([
+		{<<":method">>, <<"POST">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>}, %% @todo Correct port number.
+		{<<":path">>, <<"/">>}
+	]),
+	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, ReqHeaders1)),
+	ok = do_recv_rst_stream(Socket, 1),
+	%% This field is indexed. The next request references that entry,
+	%% so discarding the block without decoding it fails decompression.
+	{Discarded, Enc2} = cow_hpack:encode([
+		{<<"accept">>, <<"x-cowlib-linger">>}
+	], Enc1),
+	{ReqHeaders2, _} = cow_hpack:encode([
+		{<<":method">>, <<"GET">>},
+		{<<":scheme">>, <<"http">>},
+		{<<":authority">>, <<"localhost">>},
+		{<<":path">>, <<"/">>},
+		{<<"accept">>, <<"x-cowlib-linger">>}
+	], Enc2),
+	ok = gen_tcp:send(Socket, [
+		cow_http2:headers(1, fin, Discarded),
+		cow_http2:headers(3, fin, ReqHeaders2)
+	]),
+	ok = do_recv_headers(Socket, 3).
+
+do_recv_rst_stream(Socket, StreamID) ->
+	case do_recv_frame(Socket) of
+		{3, StreamID, <<0:32>>} ->
+			ok;
+		{3, StreamID, Code} ->
+			error({rst_stream, Code});
+		{7, _, Payload} ->
+			error({goaway, Payload});
+		_ ->
+			do_recv_rst_stream(Socket, StreamID)
+	end.
+
+do_recv_headers(Socket, StreamID) ->
+	case do_recv_frame(Socket) of
+		{1, StreamID, _} ->
+			ok;
+		{7, _, Payload} ->
+			error({goaway, Payload});
+		_ ->
+			do_recv_headers(Socket, StreamID)
+	end.
+
+do_recv_frame(Socket) ->
+	{ok, <<Len:24, Type:8, _:8, _:1, StreamID:31>>} = gen_tcp:recv(Socket, 9, 6000),
+	Payload = case Len of
+		0 -> <<>>;
+		_ ->
+			{ok, Data} = gen_tcp:recv(Socket, Len, 6000),
+			Data
+	end,
+	{Type, StreamID, Payload}.
+
 rst_stream_closed_accept_priority(Config) ->
 	doc("PRIORITY frames received on a stream closed via RST_STREAM "
 		"must be accepted. (RFC7540 5.1)"),
