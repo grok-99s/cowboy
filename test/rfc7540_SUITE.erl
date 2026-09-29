@@ -2051,16 +2051,18 @@ headers_after_sending_rst_stream(Config) ->
 		{<<":path">>, <<"/">>}
 	]),
 	ok = gen_tcp:send(Socket, cow_http2:headers(1, nofin, ReqHeaders1)),
-	receive
-		{tcp, Socket, <<Len1:24, 1:8, _:8, _:1, 1:31, _:Len1/binary,
-				Len2:24, 0:8, _:8, _:1, 1:31, _:Len2/binary,
-				4:24, 3:8, _:8, _:1, 1:31, 0:32, _/bits>>} ->
+	%% The response and the reset are separate writes and may arrive
+	%% in separate TCP packets.
+	{ok, Rest} = do_recv_frame(Socket, <<>>, fun
+		(3, 1, <<0:32>>) ->
 			ok;
-		{tcp_closed, Socket} ->
-			error(closed)
-	after 6000 ->
-		error(timeout)
-	end,
+		(3, 1, Code) ->
+			error({rst_stream, Code});
+		(7, _, Payload) ->
+			error({goaway, Payload});
+		(_, _, _) ->
+			continue
+	end),
 	%% This field is indexed. The next request references that entry,
 	%% so discarding the block without decoding it fails decompression.
 	{Discarded, Enc2} = cow_hpack:encode([
@@ -2077,13 +2079,36 @@ headers_after_sending_rst_stream(Config) ->
 		cow_http2:headers(1, fin, Discarded),
 		cow_http2:headers(3, fin, ReqHeaders2)
 	]),
-	receive
-		{tcp, Socket, <<_:24, 1:8, _:8, _:1, 3:31, _/bits>>} ->
+	{ok, _} = do_recv_frame(Socket, Rest, fun
+		(1, 3, _) ->
 			ok;
-		{tcp_closed, Socket} ->
-			error(closed)
-	after 6000 ->
-		error(timeout)
+		(7, _, Payload) ->
+			error({goaway, Payload});
+		(_, _, _) ->
+			continue
+	end).
+
+%% Active-mode packets are not frame boundaries. Read until Match
+%% returns ok and return the bytes that follow that frame.
+do_recv_frame(Socket, Buffer, Match) ->
+	case Buffer of
+		<<Len:24, Type:8, _:8, _:1, StreamID:31,
+				Payload:Len/binary, Rest/binary>> ->
+			case Match(Type, StreamID, Payload) of
+				ok ->
+					{ok, Rest};
+				continue ->
+					do_recv_frame(Socket, Rest, Match)
+			end;
+		_ ->
+			receive
+				{tcp, Socket, Data} ->
+					do_recv_frame(Socket, <<Buffer/binary, Data/binary>>, Match);
+				{tcp_closed, Socket} ->
+					error(closed)
+			after 6000 ->
+				error(timeout)
+			end
 	end.
 
 rst_stream_closed_accept_priority(Config) ->
